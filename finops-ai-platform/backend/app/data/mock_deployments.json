@@ -1,0 +1,94 @@
+[
+    {
+        "deployment_id": "deploy-a3f8",
+        "timestamp": "2026-02-25T09:14:00Z",
+        "service": "payments-v2",
+        "namespace": "payments",
+        "deployed_by": "sarah.chen",
+        "commit_sha": "a3f8c91",
+        "commit_message": "Scale payments service for flash sale event",
+        "changes": {
+            "replicas": {
+                "before": 2,
+                "after": 8
+            },
+            "instance_type": {
+                "before": "m5.xlarge",
+                "after": "m5.2xlarge"
+            },
+            "cpu_request": {
+                "before": "1",
+                "after": "4"
+            },
+            "memory_request": {
+                "before": "2Gi",
+                "after": "8Gi"
+            }
+        },
+        "pr_number": 847,
+        "pr_url": "https://github.com/acme/infra/pull/847",
+        "status": "success",
+        "rollback_available": true
+    },
+    {
+        "deployment_id": "deploy-b2c9",
+        "timestamp": "2026-02-20T14:32:00Z",
+        "service": "etl-pipeline",
+        "namespace": "data",
+        "deployed_by": "james.miller",
+        "commit_sha": "b2c9d04",
+        "commit_message": "Add new data source for analytics pipeline",
+        "changes": {
+            "replicas": {
+                "before": 1,
+                "after": 1
+            },
+            "env_vars_added": [
+                "NEW_DATA_SOURCE_URL",
+                "BATCH_SIZE"
+            ]
+        },
+        "pr_number": 832,
+        "pr_url": "https://github.com/acme/infra/pull/832",
+        "status": "success",
+        "rollback_available": true
+    },
+    {
+        "deployment_id": "deploy-c4d1",
+        "timestamp": "2026-02-18T10:05:00Z",
+        "service": "web-frontend",
+        "namespace": "frontend",
+        "deployed_by": "alex.wong",
+        "commit_sha": "c4d1e28",
+        "commit_message": "Update React to v19, performance improvements",
+        "changes": {
+            "image_tag": {
+                "before": "v3.1.0",
+                "after": "v3.2.0"
+            }
+        },
+        "pr_number": 825,
+        "pr_url": "https://github.com/acme/web/pull/825",
+        "status": "success",
+        "rollback_available": true
+    },
+    {
+        "deployment_id": "deploy-d5e2",
+        "timestamp": "2026-02-10T16:48:00Z",
+        "service": "payments-v2",
+        "namespace": "payments",
+        "deployed_by": "sarah.chen",
+        "commit_sha": "d5e2f37",
+        "commit_message": "Fix payment retry logic for edge cases",
+        "changes": {
+            "image_tag": {
+                "before": "v2.3.0",
+                "after": "v2.3.1"
+            }
+        },
+        "pr_number": 810,
+        "pr_url": "https://github.com/acme/infra/pull/810",
+        "status": "success",
+        "rollback_available": false
+    }
+]

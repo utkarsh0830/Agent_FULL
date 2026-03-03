@@ -1,0 +1,53 @@
+[
+    {
+        "pr_number": 847,
+        "repo": "acme/infra",
+        "timestamp": "2026-02-25T08:50:00Z",
+        "author": "sarah.chen",
+        "commit_message": "Scale payments service for flash sale event",
+        "total_monthly_before": 1200.00,
+        "total_monthly_after": 3600.00,
+        "monthly_delta": 2400.00,
+        "pct_change": 200.0,
+        "resources_changed": [
+            {
+                "name": "aws_eks_node_group.payments",
+                "type": "aws_eks_node_group",
+                "monthly_before": 800.00,
+                "monthly_after": 2560.00,
+                "delta": 1760.00
+            },
+            {
+                "name": "aws_instance.payments_worker",
+                "type": "aws_instance",
+                "monthly_before": 400.00,
+                "monthly_after": 1040.00,
+                "delta": 640.00
+            }
+        ],
+        "review_status": "not_reviewed",
+        "cost_policy_check": "skipped"
+    },
+    {
+        "pr_number": 832,
+        "repo": "acme/infra",
+        "timestamp": "2026-02-20T13:15:00Z",
+        "author": "james.miller",
+        "commit_message": "Add new data source for analytics pipeline",
+        "total_monthly_before": 450.00,
+        "total_monthly_after": 475.00,
+        "monthly_delta": 25.00,
+        "pct_change": 5.6,
+        "resources_changed": [
+            {
+                "name": "aws_lambda_function.etl_ingest",
+                "type": "aws_lambda_function",
+                "monthly_before": 30.00,
+                "monthly_after": 55.00,
+                "delta": 25.00
+            }
+        ],
+        "review_status": "reviewed",
+        "cost_policy_check": "passed"
+    }
+]
