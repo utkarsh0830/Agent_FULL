@@ -7,6 +7,7 @@ sse-starlette==2.2.1
 # LangChain + LangGraph
 langchain==0.3.14
 langchain-openai==0.3.0
+langchain-google-genai>=2.0.0
 langgraph==0.2.60
 
 # AWS
@@ -15,9 +16,30 @@ boto3==1.35.86
 # Data
 pandas==2.2.3
 numpy>=1.26,<2
+pyarrow>=14.0  # For Parquet support
 
-# Settings
+# Database
+psycopg2-binary>=2.9  # PostgreSQL driver
 pydantic-settings==2.7.1
 
 # HTTP
 httpx==0.28.1
+
+# Scheduling
+apscheduler>=3.10,<4  # In-process spike detection
+
+# Azure (optional — install only if using Azure)
+# azure-identity>=1.15
+# azure-storage-blob>=12.19
+# azure-mgmt-costmanagement>=4.0
+
+# GCP (optional — install only if using GCP)
+# google-cloud-bigquery>=3.14
+
+# Cloud Custodian (optional)
+# c7n>=0.9
+# c7n-azure>=0.4   (for Azure policies)
+# c7n-gcp>=0.4     (for GCP policies)
+
+# Infracost (CLI tool, not a pip package)
+# Install: brew install infracost

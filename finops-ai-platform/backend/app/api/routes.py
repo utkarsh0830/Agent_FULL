@@ -2,25 +2,26 @@
 FastAPI API Routes — all endpoints for the FinOps orchestration platform.
 
 Endpoints:
-- POST /api/upload-billing      → Ingest FOCUS data from S3
-- GET  /api/analysis/rca        → Run full agent chain (SSE streaming)
+- POST /api/upload-billing        → Ingest FOCUS data (mock or S3)
+- POST /api/collect                → Run multi-cloud collectors
+- POST /api/analysis/trigger       → Trigger agent chain (manual or auto)
+- GET  /api/analysis/rca           → Run full agent chain (SSE streaming)
 - GET  /api/analysis/tag-intelligence → Get tag suggestions
-- GET  /api/analysis/forecast   → Get cost forecast
-- POST /api/remediate           → Approve/reject staged remediation
-- GET  /api/costs/summary       → Cost summary from SQLite
-- GET  /api/costs/daily         → Daily time-series for charts
-- GET  /api/remediations        → List pending remediation actions
-- GET  /api/health              → Health check
+- GET  /api/analysis/forecast      → Get cost forecast
+- POST /api/remediate              → Approve/reject staged remediation
+- GET  /api/remediations           → List pending remediation actions
+- GET  /api/costs/summary          → Cost summary by dimension
+- GET  /api/costs/daily            → Daily time-series for charts
+- GET  /api/costs/anomalies        → Detect cost anomalies
+- GET  /api/costs/untagged         → List untagged resources
+- GET  /api/health                 → Health check
 """
 import json
-import asyncio
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import database as db
-from app.ingestion.s3_fetcher import fetch_from_s3
-from app.ingestion.focus_loader import load_focus_file
 from app.connectors.opencost import OpenCostConnector
 from app.connectors.cloud_custodian import CloudCustodianConnector
 from app.services.deployment_service import DeploymentService
@@ -54,19 +55,50 @@ class RemediationRequest(BaseModel):
 @router.post("/upload-billing")
 async def upload_billing(req: BillingUploadRequest):
     """
-    Ingest FOCUS billing data from S3 (or mock data in dev mode).
-    Validates FOCUS schema and loads into SQLite.
+    Ingest FOCUS billing data.
+    In mock mode: loads mock data.
+    In real mode: runs cloud collectors.
     """
     try:
-        file_path = fetch_from_s3(req.s3_bucket, req.s3_key)
-        count = load_focus_file(file_path)
+        from app.services.spike_detector import run_collectors
+        count = await run_collectors()
         return {
             "status": "success",
             "records_loaded": count,
-            "source": f"s3://{req.s3_bucket}/{req.s3_key}" if req.s3_bucket else "mock_data",
+            "source": f"s3://{req.s3_bucket}/{req.s3_key}" if req.s3_bucket else "mock_data/collectors",
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/collect")
+async def run_collection():
+    """Run multi-cloud collectors to ingest billing data from all enabled providers."""
+    try:
+        from app.services.spike_detector import run_collectors
+        count = await run_collectors()
+        return {"status": "success", "records_ingested": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/analysis/trigger")
+async def trigger_analysis(body: dict = None):
+    """
+    Trigger the full agent chain.
+    Can be called by the spike detector (with spike context)
+    or manually via API.
+    """
+    try:
+        from app.services.spike_detector import check_for_spikes
+        spikes = await check_for_spikes()
+        return {
+            "status": "triggered",
+            "spikes_found": len(spikes),
+            "spikes": spikes[:5],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -82,11 +114,10 @@ async def run_analysis():
     """
     async def event_stream():
         try:
-            # ── Gather input data ──
-            billing_data = db.get_daily_costs()  # billing time-series
+            # ── Gather input data from FOCUS database ──
+            billing_data = db.get_all_billing_records(limit=200)
             anomalies = db.detect_anomalies(threshold_pct=30)
             untagged = db.get_untagged_resources()
-            all_billing = billing_data  # For agents that need raw records
 
             # Get data from connectors
             opencost_data = await opencost.get_workload_costs()
@@ -94,11 +125,11 @@ async def run_analysis():
             infracost_data = deploy_service._load_infracost()
 
             # Combine billing data for agents
-            combined_billing = anomalies + untagged
+            combined_billing = billing_data if billing_data else anomalies + untagged
 
             # ── Build initial state ──
             initial_state = {
-                "billing_data": combined_billing if combined_billing else all_billing,
+                "billing_data": combined_billing,
                 "opencost_data": opencost_data,
                 "deployment_events": deploy_events,
                 "infracost_estimates": infracost_data,
@@ -117,7 +148,6 @@ async def run_analysis():
             # ── Run graph with streaming ──
             prev_events_count = 0
             async for chunk in finops_graph.astream(initial_state):
-                # Each chunk is a dict with the node name as key
                 for node_name, node_output in chunk.items():
                     # Emit new stream events
                     stream_events = node_output.get("stream_events", [])
@@ -152,12 +182,10 @@ async def run_analysis():
 @router.get("/analysis/tag-intelligence")
 async def get_tag_analysis():
     """Get the latest tag intelligence results (runs chain if needed)."""
-    # For direct access, run just the tag portion
-    billing_data = db.get_untagged_resources()
-    all_records = db.get_daily_costs()
+    billing_data = db.get_all_billing_records(limit=200)
 
     initial_state = {
-        "billing_data": billing_data + all_records,
+        "billing_data": billing_data,
         "opencost_data": [],
         "deployment_events": [],
         "infracost_estimates": [],
@@ -173,7 +201,7 @@ async def get_tag_analysis():
 @router.get("/analysis/forecast")
 async def get_forecast():
     """Get the latest cost forecast results."""
-    billing_data = db.get_daily_costs()
+    billing_data = db.get_all_billing_records(limit=200)
 
     initial_state = {
         "billing_data": billing_data,
@@ -227,15 +255,15 @@ async def list_remediations():
 
 
 @router.get("/costs/summary")
-async def cost_summary(group_by: str = "service_name"):
-    """Get cost summary grouped by service, region, etc."""
-    return db.get_cost_summary(group_by)
+async def cost_summary(group_by: str = "service_name", provider: str | None = None):
+    """Get cost summary grouped by service, region, etc. Optional provider filter."""
+    return db.get_cost_summary(group_by, provider=provider)
 
 
 @router.get("/costs/daily")
-async def daily_costs(service: str | None = None):
-    """Get daily cost time-series for charts."""
-    return db.get_daily_costs(service)
+async def daily_costs(service: str | None = None, provider: str | None = None):
+    """Get daily cost time-series for charts. Optional filters."""
+    return db.get_daily_costs(service, provider=provider)
 
 
 @router.get("/costs/anomalies")
@@ -257,4 +285,12 @@ async def untagged_resources():
 
 @router.get("/health")
 async def health():
-    return {"status": "healthy", "service": "finops-ai-platform"}
+    from app.config import settings
+    return {
+        "status": "healthy",
+        "service": "finops-ai-platform",
+        "version": "0.2.0",
+        "providers": settings.provider_list,
+        "database": "postgresql" if db._use_postgres() else "sqlite",
+        "mock_mode": settings.use_mock_data,
+    }

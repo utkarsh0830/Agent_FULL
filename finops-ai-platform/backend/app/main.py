@@ -1,7 +1,11 @@
 """
 FinOps AI Orchestration Platform — FastAPI Application.
 
-This is the main entry point for the backend server.
+Cloud-agnostic backend with:
+- Multi-cloud billing ingestion (AWS, Azure, GCP → FOCUS)
+- PostgreSQL centralized store (with SQLite fallback)
+- APScheduler for periodic spike detection
+- LangGraph multi-agent chain
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -13,34 +17,57 @@ from app.api.routes import router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize database on startup."""
+    """Initialize database, load data, and start spike detector."""
+    # 1. Init database schema
     init_db()
+    print("[startup] Database initialized")
 
-    # Auto-load mock data in dev mode if DB is empty
-    if settings.use_mock_data:
-        from app.database import get_connection
-        conn = get_connection()
-        count = conn.execute("SELECT COUNT(*) FROM billing_records").fetchone()[0]
-        conn.close()
-        if count == 0:
-            from app.ingestion.focus_loader import load_focus_file
-            from app.config import settings as s
-            mock_path = s.data_dir / "mock_focus_data.json"
-            if mock_path.exists():
-                loaded = load_focus_file(mock_path)
-                print(f"[startup] Loaded {loaded} mock FOCUS records into SQLite")
+    # 2. Run collectors (mock or real depending on config)
+    from app.services.spike_detector import run_collectors
+    loaded = await run_collectors()
+    print(f"[startup] Collectors loaded {loaded} records")
+
+    # 3. Start APScheduler for spike detection (non-mock mode only)
+    scheduler = None
+    if not settings.use_mock_data:
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from app.services.spike_detector import check_for_spikes
+
+            scheduler = AsyncIOScheduler()
+            scheduler.add_job(
+                check_for_spikes,
+                "interval",
+                hours=settings.spike_check_interval_hours,
+                id="spike_detector",
+                name="Cost Spike Detector",
+            )
+            scheduler.start()
+            print(
+                f"[startup] Spike detector started "
+                f"(every {settings.spike_check_interval_hours}h, "
+                f"threshold {settings.spike_threshold_pct}%)"
+            )
+        except ImportError:
+            print("[startup] APScheduler not installed, spike detection disabled")
 
     yield
+
+    # Shutdown
+    if scheduler:
+        scheduler.shutdown(wait=False)
+        print("[shutdown] Spike detector stopped")
 
 
 app = FastAPI(
     title="FinOps AI Orchestration Platform",
     description=(
-        "AI-powered orchestration layer over OpenCost, Infracost, "
-        "and Cloud Custodian. Ingests FOCUS billing data, runs "
-        "multi-agent analysis, and provides human-in-the-loop remediation."
+        "Cloud-agnostic AI orchestration layer. Ingests billing from "
+        "AWS, Azure, and GCP in FOCUS format. Runs multi-agent analysis "
+        "(RCA → Tags → Forecast → Action Planner) with human-in-the-loop "
+        "remediation via Cloud Custodian."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
