@@ -1,0 +1,480 @@
+# Cloud-Agnostic FinOps AI Platform — Revised Architecture
+
+## Design Principles
+
+1. **No cloud-specific storage** — PostgreSQL, not S3/Athena
+2. **No cloud-specific compute** — APScheduler, not Lambda
+3. **Multi-cloud connectors** — each tool supports AWS + Azure + GCP
+4. **FOCUS as the universal language** — all billing normalized before storage
+
+---
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Cloud Billing Sources"
+        AWS["☁️ AWS CUR 2.0"]
+        AZ["🔷 Azure Cost Mgmt"]
+        GCP["🟡 GCP BigQuery Export"]
+    end
+
+    subgraph "Collectors (Python)"
+        C1["aws_collector.py"]
+        C2["azure_collector.py"]
+        C3["gcp_collector.py"]
+    end
+
+    subgraph "FOCUS Normalizer"
+        NORM["focus_normalizer.py<br/>All clouds → one schema"]
+    end
+
+    subgraph "Centralized Store (Cloud-Agnostic)"
+        PG["🐘 PostgreSQL<br/>focus_billing table<br/>Runs ANYWHERE"]
+    end
+
+    subgraph "Spike Detector (In-Process)"
+        SCHED["⏰ APScheduler<br/>(runs inside FastAPI)"]
+    end
+
+    subgraph "Multi-Cloud Connectors"
+        OC["OpenCost<br/>Any K8s"]
+        IC["Infracost<br/>Any Terraform"]
+        CC["Cloud Custodian<br/>c7n / c7n-azure / c7n-gcp"]
+    end
+
+    subgraph "AI Agent Chain"
+        RCA["🔍 RCA"] --> TAG["🏷️ Tags"]
+        TAG --> FCST["📈 Forecast"]
+        FCST --> ACT["⚡ Actions"]
+    end
+
+    AWS --> C1 --> NORM
+    AZ --> C2 --> NORM
+    GCP --> C3 --> NORM
+    NORM --> PG
+    PG --> SCHED
+    SCHED -->|spike found| RCA
+    PG --> RCA
+    OC --> RCA
+    IC --> RCA
+    CC --> ACT
+```
+
+---
+
+## Why PostgreSQL, Not S3
+
+| Criteria | S3 + Athena | PostgreSQL |
+|---|---|---|
+| Runs on AWS only? | ✅ Yes (vendor lock-in) | ❌ Runs anywhere |
+| Managed options | Only AWS | AWS RDS, Azure Database, GCP Cloud SQL, Supabase, self-hosted |
+| Self-hostable | ❌ | ✅ Docker, K8s, bare metal |
+| Query language | SQL (Athena-specific) | Standard SQL |
+| Real-time queries | ~5s startup lag | Instant (<50ms) |
+| Schema enforcement | Glue Crawler (AWS) | Native DDL |
+| Cost at FinOps scale | $5/TB scanned | Free (self-hosted) or ~$15/mo managed |
+
+> [!TIP]
+> A year of billing data for 3 clouds with resource-level detail is typically **1-10M rows** — PostgreSQL handles this trivially with proper indexing. No need for a data lake.
+
+---
+
+## Phase 1: FOCUS Schema & PostgreSQL
+
+### FOCUS Table Schema
+
+```sql
+CREATE TABLE focus_billing (
+    id              BIGSERIAL PRIMARY KEY,
+    -- FOCUS core columns
+    provider        VARCHAR(20) NOT NULL,   -- AWS | Azure | GCP
+    billing_period_start TIMESTAMP NOT NULL,
+    billing_period_end   TIMESTAMP,
+    billed_cost     DECIMAL(12,4) NOT NULL,
+    effective_cost  DECIMAL(12,4),
+    billing_currency VARCHAR(3) DEFAULT 'USD',
+    -- Resource identification
+    service_name    VARCHAR(255),
+    service_category VARCHAR(255),
+    resource_id     VARCHAR(512),
+    resource_name   VARCHAR(255),
+    resource_type   VARCHAR(255),
+    region          VARCHAR(100),
+    availability_zone VARCHAR(100),
+    -- Account hierarchy
+    billing_account_id   VARCHAR(255),
+    billing_account_name VARCHAR(255),
+    sub_account_id       VARCHAR(255),
+    sub_account_name     VARCHAR(255),
+    -- Tags (JSONB for flexible key-value pairs)
+    tags            JSONB DEFAULT '{}',
+    -- Usage
+    usage_quantity  DECIMAL(18,6),
+    usage_unit      VARCHAR(50),
+    pricing_quantity DECIMAL(18,6),
+    pricing_unit    VARCHAR(50),
+    -- Metadata
+    charge_type     VARCHAR(50),  -- Usage | Purchase | Tax | Credit
+    ingested_at     TIMESTAMP DEFAULT NOW(),
+
+    -- Indexes for common queries
+    CONSTRAINT valid_provider CHECK (provider IN ('AWS', 'Azure', 'GCP'))
+);
+
+-- Performance indexes
+CREATE INDEX idx_billing_period ON focus_billing(billing_period_start);
+CREATE INDEX idx_provider ON focus_billing(provider);
+CREATE INDEX idx_service ON focus_billing(service_name);
+CREATE INDEX idx_resource ON focus_billing(resource_id);
+CREATE INDEX idx_tags ON focus_billing USING GIN(tags);
+```
+
+### Docker Compose Addition
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: finops
+      POSTGRES_USER: finops
+      POSTGRES_PASSWORD: finops_secret
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+volumes:
+  pgdata:
+```
+
+---
+
+## Phase 2: Multi-Cloud Collectors
+
+### 2.1 AWS Collector
+
+Source: **CUR 2.0** (native FOCUS, Parquet in S3)
+
+```bash
+# Prerequisites
+aws configure  # IAM keys with s3:GetObject on CUR bucket
+```
+
+```python
+# app/collectors/aws_collector.py
+# Downloads CUR Parquet from S3 → reads with pandas → inserts into PostgreSQL
+# AWS CUR 2.0 already uses FOCUS columns — minimal mapping needed
+
+AWS_TO_FOCUS = {
+    "bill_billing_period_start_date": "billing_period_start",
+    "line_item_blended_cost":         "billed_cost",
+    "product_servicename":            "service_name",
+    "line_item_resource_id":          "resource_id",
+    "resource_tags":                  "tags",  # parse JSON
+}
+```
+
+### 2.2 Azure Collector
+
+Source: **Cost Management API** or **scheduled exports to Azure Blob**
+
+```bash
+# Prerequisites
+pip install azure-identity azure-mgmt-costmanagement azure-storage-blob
+
+az login
+az costmanagement export create \
+  --name finops-export \
+  --type ActualCost \
+  --scope "/subscriptions/SUB_ID" \
+  --storage-account finopsstorage \
+  --storage-container billing \
+  --timeframe MonthToDate \
+  --schedule-recurrence Daily
+```
+
+```python
+# app/collectors/azure_collector.py
+AZURE_TO_FOCUS = {
+    "CostInBillingCurrency": "billed_cost",
+    "ServiceName":           "service_name",
+    "ResourceId":            "resource_id",
+    "ResourceGroup":         "sub_account_name",
+    "SubscriptionName":      "billing_account_name",
+    "Date":                  "billing_period_start",
+    "Tags":                  "tags",
+    "ResourceLocation":      "region",
+    "MeterCategory":         "service_category",
+    "Currency":              "billing_currency",
+}
+```
+
+### 2.3 GCP Collector
+
+Source: **BigQuery billing export**
+
+```bash
+# Prerequisites
+pip install google-cloud-bigquery
+
+gcloud auth application-default login
+# Enable billing export: GCP Console → Billing → Billing Export → BigQuery
+```
+
+```python
+# app/collectors/gcp_collector.py
+GCP_TO_FOCUS = {
+    "cost":                  "billed_cost",
+    "service.description":   "service_name",
+    "sku.description":       "resource_type",
+    "project.id":            "sub_account_id",
+    "project.name":          "sub_account_name",
+    "usage_start_time":      "billing_period_start",
+    "labels":                "tags",      # [{key,value}] → JSONB
+    "location.region":       "region",
+    "currency":              "billing_currency",
+}
+```
+
+### 2.4 Shared FOCUS Normalizer
+
+```python
+# app/collectors/focus_normalizer.py
+# Used by ALL collectors after column mapping
+
+def normalize_to_focus(df: pd.DataFrame, provider: str) -> list[dict]:
+    """
+    Final normalization: enforce types, fill defaults, add provider.
+    Returns list of dicts ready for PostgreSQL insert.
+    """
+    df["provider"] = provider
+    df["billed_cost"] = pd.to_numeric(df["billed_cost"], errors="coerce").fillna(0)
+    df["billing_period_start"] = pd.to_datetime(df["billing_period_start"])
+    df["tags"] = df["tags"].apply(parse_tags_to_json)
+    return df.to_dict(orient="records")
+```
+
+---
+
+## Phase 3: Spike Detection (No Lambda)
+
+Instead of AWS Lambda, use **APScheduler** running inside the FastAPI process:
+
+```python
+# app/services/spike_detector.py
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+SPIKE_SQL = """
+WITH daily AS (
+    SELECT DATE(billing_period_start) as day, provider,
+           SUM(billed_cost) as cost
+    FROM focus_billing
+    WHERE billing_period_start >= NOW() - INTERVAL '14 days'
+    GROUP BY 1, 2
+),
+baselines AS (
+    SELECT provider, AVG(cost) as avg_daily
+    FROM daily WHERE day < CURRENT_DATE - 1
+    GROUP BY provider
+)
+SELECT d.day, d.provider, d.cost, b.avg_daily,
+       ((d.cost - b.avg_daily) / NULLIF(b.avg_daily, 0) * 100) as pct_change
+FROM daily d JOIN baselines b ON d.provider = b.provider
+WHERE d.day >= CURRENT_DATE - 1
+  AND d.cost > b.avg_daily * 1.20
+ORDER BY pct_change DESC
+"""
+
+async def check_for_spikes():
+    """Runs every hour via APScheduler."""
+    spikes = await db.fetch_all(SPIKE_SQL)
+    if spikes:
+        # Trigger agent chain automatically
+        await trigger_analysis(spikes)
+        await send_alert(spikes)  # Slack/Email/webhook
+```
+
+```python
+# In main.py lifespan
+scheduler = AsyncIOScheduler()
+scheduler.add_job(check_for_spikes, "interval", hours=1)
+scheduler.start()
+```
+
+> [!TIP]
+> **Why APScheduler over Lambda?**
+> - Runs in-process — no AWS dependency
+> - Works on any cloud, Docker, or local machine
+> - Can be swapped for Celery Beat, K8s CronJob, or cloud-specific scheduler later
+
+---
+
+## Phase 4: Multi-Cloud Connectors
+
+### 4.1 OpenCost — Already Cloud-Agnostic ✅
+
+OpenCost runs on **any Kubernetes cluster** (EKS, AKS, GKE, self-hosted):
+
+```bash
+# AWS EKS
+helm install opencost opencost/opencost -n opencost --create-namespace
+
+# Azure AKS
+helm install opencost opencost/opencost -n opencost --create-namespace \
+  --set opencost.exporter.defaultClusterId=aks-cluster
+
+# GCP GKE
+helm install opencost opencost/opencost -n opencost --create-namespace \
+  --set opencost.exporter.defaultClusterId=gke-cluster
+```
+
+**No code change needed** — same API (`/allocation`, `/assets`) regardless of cloud.
+
+### 4.2 Infracost — Already Cloud-Agnostic ✅
+
+Infracost works with **any Terraform provider**:
+
+```bash
+# AWS resources
+infracost breakdown --path ./terraform/aws --format json
+
+# Azure resources
+infracost breakdown --path ./terraform/azure --format json
+
+# GCP resources
+infracost breakdown --path ./terraform/gcp --format json
+```
+
+**No code change needed** — same CLI, same JSON output format.
+
+### 4.3 Cloud Custodian — Needs Multi-Cloud Packages
+
+```bash
+# Install per-cloud packages
+pip install c7n          # AWS
+pip install c7n-azure    # Azure
+pip install c7n-gcp      # GCP
+```
+
+**Code change needed:** Update [cloud_custodian.py](file:///Users/utkarsh/Documents/Agents/finops-ai-platform/backend/app/connectors/cloud_custodian.py) to detect provider and use correct runner:
+
+```python
+# app/connectors/cloud_custodian.py (updated)
+
+async def run_policy(policy_path: str, provider: str, dry_run: bool = True):
+    if provider == "AWS":
+        cmd = ["custodian", "run", "--dry-run" if dry_run else "", "-s", output_dir, policy_path]
+    elif provider == "Azure":
+        cmd = ["custodian", "run", "--dry-run" if dry_run else "", "-s", output_dir,
+               "--provider", "azure", policy_path]
+    elif provider == "GCP":
+        cmd = ["custodian", "run", "--dry-run" if dry_run else "", "-s", output_dir,
+               "--provider", "gcp", policy_path]
+```
+
+**Per-cloud policy directories:**
+```
+custodian-policies/
+├── aws/
+│   ├── unused-ebs.yml
+│   └── idle-ec2.yml
+├── azure/
+│   ├── unused-disks.yml
+│   └── idle-vms.yml
+└── gcp/
+    ├── unused-disks.yml
+    └── idle-instances.yml
+```
+
+---
+
+## Phase 5: Updated Project Structure
+
+```
+finops-ai-platform/
+├── backend/
+│   └── app/
+│       ├── collectors/              ← NEW: multi-cloud billing
+│       │   ├── aws_collector.py
+│       │   ├── azure_collector.py
+│       │   ├── gcp_collector.py
+│       │   └── focus_normalizer.py
+│       ├── services/
+│       │   ├── pg_client.py         ← NEW: PostgreSQL queries
+│       │   ├── spike_detector.py    ← NEW: APScheduler-based
+│       │   └── deployment_service.py
+│       ├── connectors/
+│       │   ├── opencost.py          ← unchanged (already agnostic)
+│       │   ├── infracost.py         ← unchanged (already agnostic)
+│       │   └── cloud_custodian.py   ← MODIFY: add Azure/GCP support
+│       ├── agents/                  ← unchanged (sees only FOCUS)
+│       └── api/
+├── custodian-policies/
+│   ├── aws/
+│   ├── azure/
+│   └── gcp/
+└── docker-compose.yml               ← add PostgreSQL service
+```
+
+---
+
+## Updated [.env](file:///Users/utkarsh/Documents/Agents/finops-ai-platform/backend/.env)
+
+```env
+# LLM
+LLM_PROVIDER=groq
+GROQ_API_KEY=gsk_...
+
+# PostgreSQL (runs anywhere)
+DATABASE_URL=postgresql://finops:finops_secret@localhost:5432/finops
+
+# AWS
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_CUR_BUCKET=my-cur-bucket
+
+# Azure
+AZURE_TENANT_ID=...
+AZURE_CLIENT_ID=...
+AZURE_CLIENT_SECRET=...
+AZURE_SUBSCRIPTION_ID=...
+AZURE_COST_STORAGE_ACCOUNT=...
+
+# GCP
+GCP_PROJECT_ID=my-project
+GCP_BIGQUERY_DATASET=billing_export
+GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json
+
+# Connectors (same for any cloud)
+OPENCOST_API_URL=http://localhost:9003
+INFRACOST_API_KEY=ico-...
+
+# Spike detection
+SPIKE_CHECK_INTERVAL_HOURS=1
+SPIKE_THRESHOLD_PCT=20
+
+# Feature flags
+USE_MOCK_DATA=false
+ENABLED_PROVIDERS=AWS,Azure,GCP
+```
+
+---
+
+## Execution Order
+
+| # | Task | Depends On |
+|---|---|---|
+| 1 | Add PostgreSQL to Docker Compose | Nothing |
+| 2 | Create FOCUS schema + `pg_client.py` | Step 1 |
+| 3 | Build `focus_normalizer.py` | Step 2 |
+| 4 | Build AWS collector | Steps 2-3 |
+| 5 | Build Azure collector | Steps 2-3 |
+| 6 | Build GCP collector | Steps 2-3 |
+| 7 | Build `spike_detector.py` with APScheduler | Step 2 |
+| 8 | Update Cloud Custodian for multi-cloud | Nothing |
+| 9 | Update API routes to use PostgreSQL | Step 2 |
+| 10 | Update agents to read from PostgreSQL | Step 9 |
+| 11 | End-to-end test | All |
+
+> [!IMPORTANT]
+> **Zero changes** to the 4 AI agents or the LangGraph chain — they only see FOCUS-normalized data regardless of which cloud it came from.
